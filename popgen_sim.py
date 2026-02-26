@@ -923,12 +923,22 @@ class SelectionResult:
         Diploid genotype frequencies per generation (before selection).
     w_bar : list of float
         Mean population fitness per generation.
+    marginal_fitness : list of ndarray, each shape (k,)
+        Marginal fitness w̄_i = sum_j p_j * W_ij for each allele.
+    avg_excess : list of ndarray, each shape (k,)
+        Average excess of fitness: a_i = w̄_i - w̄.
+        Allele frequency change is: Δp_i = p_i * a_i / w̄.
+    delta_p : list of ndarray, each shape (k,)
+        Per-generation change in allele frequency.
     """
     params: SelectionParams
     generations: List[int] = field(default_factory=list)
     allele_freqs: List[np.ndarray] = field(default_factory=list)
     genotype_freqs: List[np.ndarray] = field(default_factory=list)
     w_bar: List[float] = field(default_factory=list)
+    marginal_fitness: List[np.ndarray] = field(default_factory=list)
+    avg_excess: List[np.ndarray] = field(default_factory=list)
+    delta_p: List[np.ndarray] = field(default_factory=list)
 
 
 def simulate_selection(params: SelectionParams) -> SelectionResult:
@@ -937,8 +947,14 @@ def simulate_selection(params: SelectionParams) -> SelectionResult:
 
     Each generation:
       1. HW genotype frequencies from current allele freqs
-      2. Viability selection (multiply by W, normalize)
-      3. New allele freqs by marginalizing genotype freqs
+      2. Compute marginal fitness w̄_i and average excess a_i = w̄_i - w̄
+      3. Viability selection (multiply by W, normalize)
+      4. New allele freqs by marginalizing genotype freqs
+
+    Average excess of fitness for allele i:
+      w̄_i = sum_j p_j * W_ij   (marginal fitness)
+      a_i  = w̄_i - w̄           (average excess)
+      Δp_i = p_i * a_i / w̄     (allele frequency change)
     """
     k = params.n_alleles
     W = params.W
@@ -953,20 +969,26 @@ def simulate_selection(params: SelectionParams) -> SelectionResult:
         # Mean fitness
         w_bar = np.sum(W * G)
 
-        # Record state (before selection for gen > 0, or initial for gen 0)
+        # Marginal fitness: w̄_i = sum_j p_j * W_ij
+        w_marginal = W @ p
+
+        # Average excess: a_i = w̄_i - w̄
+        a = w_marginal - w_bar
+
+        # Record state
         result.generations.append(gen)
         result.allele_freqs.append(p.copy())
         result.genotype_freqs.append(G.copy())
         result.w_bar.append(w_bar)
+        result.marginal_fitness.append(w_marginal.copy())
+        result.avg_excess.append(a.copy())
+
+        # Δp (record the change that *will* happen)
+        dp = p * a / w_bar
+        result.delta_p.append(dp.copy())
 
         # Selection + new allele freqs
         G_prime = (W * G) / w_bar
-        # Allele freq = marginal sum: p_i' = sum_j G'_ij
-        # But since G' is symmetric for diploids, summing either axis works;
-        # however we stored G_ij = p_i * p_j so G'_ij = W_ij * p_i * p_j / w_bar.
-        # The new frequency of allele i is sum over all genotypes carrying i:
-        #   p_i' = G'_ii + 0.5 * sum_{j != i} (G'_ij + G'_ji)
-        # Since G' is symmetric: p_i' = G'_ii + sum_{j != i} G'_ij = sum_j G'_ij
         p = G_prime.sum(axis=1)
 
         # Safety: normalize and clip
@@ -980,31 +1002,58 @@ def simulate_selection(params: SelectionParams) -> SelectionResult:
 # Selection Plotting
 # =============================================================================
 
-def plot_selection(result: SelectionResult, figsize: Tuple[int, int] = (14, 5)):
+def plot_selection(result: SelectionResult, figsize: Tuple[int, int] = (15, 8),
+                   log_scale: bool = False):
     """
-    Plot allele frequency trajectories, genotype frequencies, and mean fitness.
+    Plot allele frequency trajectories, average excess, genotype frequencies,
+    and mean fitness (2×2 layout).
+
+    Parameters
+    ----------
+    log_scale : bool
+        If True, use log scale for the allele frequency y-axis.
+        Useful when alleles start rare or are lost.
     """
     params = result.params
     k = params.n_alleles
     labels = params.allele_labels
     gens = result.generations
 
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
 
     # --- Panel 1: Allele frequency trajectories ---
-    ax = axes[0]
+    ax = axes[0, 0]
     for i in range(k):
         freqs_i = [af[i] for af in result.allele_freqs]
         color = COLORS_ALLELES[i % len(COLORS_ALLELES)]
         ax.plot(gens, freqs_i, color=color, lw=2, label=labels[i])
     ax.set_xlabel('Generation')
     ax.set_ylabel('Allele frequency')
-    ax.set_title('Allele Frequencies')
-    ax.set_ylim(-0.02, 1.02)
+    if log_scale:
+        ax.set_yscale('log')
+        all_freqs = np.array(result.allele_freqs)
+        fmin = all_freqs[all_freqs > 0].min() if (all_freqs > 0).any() else 1e-12
+        ax.set_ylim(fmin * 0.5, 2)
+        ax.set_title('Allele Frequencies (log scale)')
+    else:
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_title('Allele Frequencies')
     ax.legend(loc='best')
 
-    # --- Panel 2: Genotype frequencies (stacked area) ---
-    ax = axes[1]
+    # --- Panel 2: Average excess of fitness ---
+    ax = axes[0, 1]
+    for i in range(k):
+        ae_i = [ae[i] for ae in result.avg_excess]
+        color = COLORS_ALLELES[i % len(COLORS_ALLELES)]
+        ax.plot(gens, ae_i, color=color, lw=2, label=labels[i])
+    ax.axhline(0, color='gray', ls='--', lw=0.5)
+    ax.set_xlabel('Generation')
+    ax.set_ylabel('Average excess (w̄ᵢ − w̄)')
+    ax.set_title('Average Excess of Fitness')
+    ax.legend(loc='best')
+
+    # --- Panel 3: Genotype frequencies (stacked area) ---
+    ax = axes[1, 0]
     geno_info = params.genotype_labels()
     geno_trajs = []
     geno_labels = []
@@ -1028,8 +1077,8 @@ def plot_selection(result: SelectionResult, figsize: Tuple[int, int] = (14, 5)):
     ax.set_ylim(0, 1)
     ax.legend(loc='upper right', fontsize=8)
 
-    # --- Panel 3: Mean fitness ---
-    ax = axes[2]
+    # --- Panel 4: Mean fitness ---
+    ax = axes[1, 1]
     ax.plot(gens, result.w_bar, color='#333333', lw=2)
     ax.set_xlabel('Generation')
     ax.set_ylabel('Mean fitness (w̄)')
@@ -1136,8 +1185,15 @@ def plot_selection_trajectory(result: SelectionResult,
     return fig, ax
 
 
-def make_selection_player(result: SelectionResult):
-    """Create interactive player for selection simulation results."""
+def make_selection_player(result: SelectionResult, log_scale: bool = False):
+    """
+    Create interactive player for selection simulation results.
+
+    Parameters
+    ----------
+    log_scale : bool
+        If True, use log scale for the allele frequency y-axis.
+    """
     import ipywidgets as widgets
     from IPython.display import clear_output
 
@@ -1176,10 +1232,10 @@ def make_selection_player(result: SelectionResult):
         with out:
             clear_output(wait=True)
 
-            fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+            fig, axes = plt.subplots(2, 2, figsize=(14, 9))
 
             # --- Allele frequency trajectories ---
-            ax = axes[0]
+            ax = axes[0, 0]
             for i in range(k):
                 freqs_i = [af[i] for af in result.allele_freqs[:gen+1]]
                 color = COLORS_ALLELES[i % len(COLORS_ALLELES)]
@@ -1187,14 +1243,39 @@ def make_selection_player(result: SelectionResult):
                         color=color, lw=2, label=labels[i])
             ax.axvline(gen, color='red', ls='-', lw=1, alpha=0.5)
             ax.set_xlim(0, n_gen)
-            ax.set_ylim(-0.02, 1.02)
+            if log_scale:
+                ax.set_yscale('log')
+                all_freqs = np.array(result.allele_freqs)
+                fmin = all_freqs[all_freqs > 0].min() if (all_freqs > 0).any() else 1e-12
+                ax.set_ylim(fmin * 0.5, 2)
+                ax.set_title('Allele Frequencies (log scale)')
+            else:
+                ax.set_ylim(-0.02, 1.02)
+                ax.set_title('Allele Frequencies')
+            ax.legend(loc='best', fontsize=9)
+
+            # --- Average excess ---
+            ax = axes[0, 1]
+            for i in range(k):
+                ae_i = [ae[i] for ae in result.avg_excess[:gen+1]]
+                color = COLORS_ALLELES[i % len(COLORS_ALLELES)]
+                ax.plot(result.generations[:gen+1], ae_i,
+                        color=color, lw=2, label=labels[i])
+            ax.axhline(0, color='gray', ls='--', lw=0.5)
+            ax.axvline(gen, color='red', ls='-', lw=1, alpha=0.5)
+            ax.set_xlim(0, n_gen)
+            # Set y limits from full data to keep scale stable
+            all_ae = np.array(result.avg_excess)
+            ae_min, ae_max = all_ae.min(), all_ae.max()
+            ae_margin = max((ae_max - ae_min) * 0.1, 0.005)
+            ax.set_ylim(ae_min - ae_margin, ae_max + ae_margin)
             ax.set_xlabel('Generation')
-            ax.set_ylabel('Frequency')
-            ax.set_title('Allele Frequencies')
+            ax.set_ylabel('w̄ᵢ − w̄')
+            ax.set_title(f'Average Excess of Fitness (Gen {gen})')
             ax.legend(loc='best', fontsize=9)
 
             # --- Genotype bar chart ---
-            ax = axes[1]
+            ax = axes[1, 0]
             G = result.genotype_freqs[gen]
             geno_vals = []
             geno_labs = []
@@ -1222,7 +1303,7 @@ def make_selection_player(result: SelectionResult):
                         fontsize=9)
 
             # --- Mean fitness trajectory ---
-            ax = axes[2]
+            ax = axes[1, 1]
             ax.plot(result.generations[:gen+1], result.w_bar[:gen+1],
                     color='#333333', lw=2)
             ax.axvline(gen, color='red', ls='-', lw=1, alpha=0.5)
@@ -1247,7 +1328,7 @@ def make_selection_player(result: SelectionResult):
                 )
                 fitness_lines.append(row)
             fitness_text = '\n'.join(fitness_lines)
-            fig.text(0.72, -0.08, fitness_text, fontsize=9,
+            fig.text(0.72, -0.02, fitness_text, fontsize=9,
                      fontfamily='monospace', va='top')
 
             plt.tight_layout()
